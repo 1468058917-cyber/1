@@ -1,0 +1,1679 @@
+classdef EKF10_13_8_1 < handle
+    properties(Access = public)
+        % 基础变量
+        sensors = 1;
+        P_EKF = zeros(4); Q = zeros(4); Ra = zeros(3); Rm = zeros(3); R1 = zeros(3); R2 = zeros(3);
+        fa = zeros(1,3); fa_num = 0;
+        k_first = 0; % 校准时间计数
+        q_k2;
+
+        % 磁力计相关
+        magXZS; P_k1; P_k2; quat_k1; quat_k2; quat_k3;
+        MAG_Fa0; MAG_MO0; MAG_Fam; MAG_MOm; fa1; t_a; t_m; pass_r = 0; MAG_MO; MAG_Z0;
+        MAG_OMOm; MAG_OFam; MAG_Zm;
+        EnvironmentMagStatus;
+        RecoverSignalEKF;
+        InitNumber; MeanACC; MeanMAG; MAG_InitialModule;
+        MAG_MOm_xy; % 假北状态下的水平分量基准(x,y)
+        
+        % 磁场强度相关（增强版）
+        MAG_ReferenceStrength = 0;          % 初始化阶段的磁场强度基准值
+        strength_threshold = 0.15;          % 磁场强度归一化偏差阈值
+        strength_update_interval = 25;      % 基础强度更新间隔（帧数）
+        strength_update_counter = 0;        % 强度更新计数器
+        strength_smooth_factor = 0.02;      % 基础强度平滑因子
+        stable_strength_count = 0;          % 稳定强度计数
+        strength_variance = 0;              % 强度方差（用于稳定性判断）
+        strength_history = [];              % 强度历史记录
+        max_strength_history = 20;          % 最大强度历史记录长度
+        
+        % 真北状态强度更新参数（增强）
+        true_north_strength_interval = 6;   % 真北状态更新间隔（更频繁）
+        true_north_strength_smooth = 0.12;  % 真北状态平滑因子（更快收敛）
+        
+        % 加速度计EKF
+        X_ACC_EKF; MAG_LastTrue; gyrstatic; accstatic;
+        P_ACC_EKF; Q_ACC_EKF; ERR_ACC_EKF1; ERR_ACC_EKF2; ERR_ACC_EKF3; R_ACC_EKF; acc_EKF;
+        
+        % 磁力计EKF
+        X_MAG_EKF; MAG_InitialModule_m;
+        P_MAG_EKF; Q_MAG_EKF; R_MAG_EKF; mag_EKF;
+        
+        % 四元数相关
+        quat_EKF; quat_Filter; quat_GYR = [1,0,0,0];
+        
+        % 状态标识
+        current_state = 'unstable'; % 'true_north'/'fake_north'/'unstable'
+        prev_state = 'unstable';
+        current_state_code = 2; % 状态编码：真北=0，假北=1，不稳定=2
+        state_history = []; % 逐帧保存状态编码（0/1/2）
+        
+        % 状态判断参数历史记录
+        state_params_history = struct(...
+            'jiao0_2', [], ...       % 磁场方向角度差（真北判断用）
+            'jiao_mag_2', [], ...    % 磁场方位角差（真北判断用）
+            'bz2', [], ...           % 当前Z轴分量（真北判断用）
+            'mag0_ss', [], ...       % 当前磁场模值（真北判断用）
+            'jiaom', [], ...         % 姿态角度差（固定阈值判断用）
+            'jiaom_mag', [], ...     % 磁场方向差（固定阈值判断用）
+            'bx_diff', [], ...       % X轴水平分量差（固定阈值判断用）
+            'by_diff', [], ...       % Y轴水平分量差（固定阈值判断用）
+            'bz_diff', [], ...       % Z轴分量差（固定阈值判断用）
+            'module_diff', [], ...   % 模值差异（固定阈值判断用）
+            'strength_bias', [], ... % 新增：磁场强度归一化偏差
+            'trust_flag', [], ...    % 固定阈值可信标志（1=可信，0=不可信）
+            'mag_declination', [], ... % 磁偏角
+            'timestamp', [] ...      % 时间戳
+        );
+        
+        % 测量噪声
+        Racc_use; Racc_static; Rmag_use; Rmag_static;
+        
+        % 状态标志
+        gyr_vec_flag = 0;
+        refer_dtime = 0;
+        refer_dtimeTh = 1;
+        FastMovementTime; QuickRecover; QuitReturnCtrlNumber;
+        sensorQuitReturnCtrl;
+        
+        % 姿态角相关
+        Jiao_ACC;
+        MAXERR = 0;
+        accLast; % 记录上一时刻加速度
+        
+        % 调试变量
+        jiao_acc_see = 0;
+        accErr_see = 0;
+        gyrErr_see = 0;
+        RecoverSignalEKF_see = 0;
+        
+        % 固定阈值参数（替换贝叶斯和模糊决策）
+        fixed_threshold = struct(...
+            'jiaom', 0.12, ...           % 姿态角度差阈值
+            'jiaom_mag', 0.035, ...      % 磁场方向差阈值
+            'bx', 0.07, ...              % X轴分量差阈值
+            'by', 0.07, ...              % Y轴分量差阈值
+            'bz', 0.085, ...             % Z轴分量差阈值
+            'module', 0.095, ...         % 模值差异阈值
+            'strength', 0.15, ...        % 磁场强度偏差阈值
+            'trust_count', 5 ...         % 连续可信帧数要求
+        );
+        
+        % 磁偏角相关参数（增强版）
+        declination_threshold = deg2rad(3); % 5°≈0.0873弧度
+        mag_declination_reference = 0;      % 动态磁偏角基准
+        declination_update_interval = 30;   % 基础更新间隔（帧数）
+        declination_update_counter = 0;     % 磁偏角更新计数器
+        declination_smooth_factor = 0.02;   % 基础平滑因子
+        stable_mag_count = 0;               % 稳定磁场计数
+        declination_variance = 0;           % 磁偏角方差（用于稳定性判断）
+        declination_history = [];           % 磁偏角历史记录
+        max_declination_history = 20;       % 最大历史记录长度
+        
+        % 真北状态磁偏角更新参数（增强）
+        true_north_update_interval = 8;     % 真北状态更新间隔（更频繁）
+        true_north_smooth_factor = 0.15;    % 真北状态平滑因子（更快收敛）
+        
+        % 自适应更新参数
+        adaptive_update_enabled = true;     % 启用自适应更新
+        min_smooth_factor = 0.01;           % 最小平滑因子
+        max_smooth_factor = 0.2;            % 最大平滑因子
+        variance_threshold = 0.005;         % 方差阈值（用于判断稳定性）
+        
+        % 性能监控（增强）
+        performance_log = struct(...
+            'mag_fix_count', 0, ...
+            'mag_reject_count', 0, ...
+            'acc_fix_count', 0, ...
+            'avg_acc_error', 0, ...
+            'environment_type', 'office', ...
+            'true_north_count', 0, ...
+            'fake_north_count', 0, ...
+            'unstable_count', 0, ...
+            'declination_accepted_count', 0, ...
+            'declination_rejected_count', 0, ...
+            'state_switch_true_to_fake', 0, ...
+            'state_switch_fake_to_true', 0, ...
+            'fixed_threshold_pass_count', 0, ...
+            'fixed_threshold_fail_count', 0, ...
+            'declination_updates', 0, ...
+            'strength_updates', 0, ...
+            'adaptive_updates', 0, ...           % 新增：自适应更新次数
+            'stability_improvements', 0, ...     % 新增：稳定性改善次数
+            'variance_reductions', 0 ...         % 新增：方差减少次数
+        );
+        
+        % 固定阈值相关变量
+        trust_frame_count = 0; % 连续可信帧计数
+    end
+
+    methods(Access = public)
+        %% 初始化
+        function self = EKF10_13_8_1()
+            self.ekf_init();
+            self.k_first = 0;
+            self.fa = zeros(1,3);
+            self.fa_num = 0;
+            self.InitNumber = 1;
+
+            % 初始化变量
+            self.MAG_Fa0 = zeros(1,3);
+            self.MeanACC = zeros(1,3);
+            self.MeanMAG = zeros(1,3);
+            self.MAG_InitialModule = 0;
+            self.MAG_ReferenceStrength = 0;
+            self.X_ACC_EKF = zeros(1,3);
+            self.X_MAG_EKF = [0,0,0,0,0,0];
+            self.accLast = zeros(1,3);
+            self.MAG_MOm_xy = zeros(1,2);
+            
+            % 四元数初始化
+            self.quat_EKF = [1,0,0,0];
+            self.quat_Filter = [1,0,0,0];
+            self.quat_GYR = [1,0,0,0];
+            
+            % 固定阈值参数初始化
+            self.trust_frame_count = 0;
+            
+            % 磁偏角相关初始化（增强）
+            self.mag_declination_reference = 0;
+            self.declination_update_counter = 0;
+            self.stable_mag_count = 0;
+            self.declination_variance = 0;
+            self.declination_history = [];
+            
+            % 磁场强度相关初始化（增强）
+            self.strength_update_counter = 0;
+            self.stable_strength_count = 0;
+            self.strength_variance = 0;
+            self.strength_history = [];
+            
+            % 初始化状态历史记录
+            self.state_history = [];
+            self.state_params_history = struct(...
+                'jiao0_2', [], ...
+                'jiao_mag_2', [], ...
+                'bz2', [], ...
+                'mag0_ss', [], ...
+                'jiaom', [], ...
+                'jiaom_mag', [], ...
+                'bx_diff', [], ...
+                'by_diff', [], ...
+                'bz_diff', [], ...
+                'module_diff', [], ...
+                'strength_bias', [], ...
+                'trust_flag', [], ...
+                'mag_declination', [], ...
+                'timestamp', [] ...
+            );
+        end
+
+        %% EKF初始化
+        function ekf_init(self)
+            % 办公室环境优化的协方差矩阵
+            self.P_EKF = eye(4) * 1.2e-2;
+            self.Q = eye(4) * 0.3e-2;
+            
+            % 办公室环境优化的测量噪声
+            self.Racc_static = eye(3) * 6e+1;
+            self.Rmag_static = eye(3) * 3.5e+2;
+            
+            self.R1 = zeros(3);
+            self.R2 = zeros(3);
+            self.ACCEKF_init();
+            self.MAGEKF_init();
+            self.sensorQuitReturnCtrl = 0;
+        end
+
+        %% 加速度计EKF初始化
+        function ACCEKF_init(self)
+            self.ERR_ACC_EKF1 = 0;
+            self.ERR_ACC_EKF2 = 0;
+            self.ERR_ACC_EKF3 = 0;
+            self.P_ACC_EKF = eye(3)*1e-3;
+            self.Q_ACC_EKF = eye(3)*3e-1;
+            self.R_ACC_EKF = eye(3)*1e+3;
+        end
+
+        %% 磁力计EKF初始化
+        function MAGEKF_init(self)
+            self.P_MAG_EKF = eye(6)*1e-3;
+            self.Q_MAG_EKF = eye(6)*1e-2;
+            self.R_MAG_EKF = eye(3)*1e+2;
+        end
+        
+        %% 磁偏角计算函数（基于重力方向）
+        function mag_declination = calculate_mag_declination(self, acc_T, m_n)
+            % acc_T：载体坐标系下的重力方向（由加速度计EKF输出修正）
+            % m_n：导航坐标系下的磁场向量
+            % 计算磁偏角（磁场方向与地理北向的夹角，范围[-pi, pi]）
+            
+            % 地理北向在水平面上的投影（2维向量）
+            north_vec = [1, 0];  % 与mag_horizontal维度匹配
+            
+            % 磁场向量在水平面上的投影（去除z轴分量，2维向量）
+            mag_horizontal = m_n(1:2);
+            mag_horizontal_norm = module(mag_horizontal);
+            
+            if mag_horizontal_norm < 1e-6
+                mag_declination = pi; % 磁场水平分量为0时，默认磁偏角超阈值
+                return;
+            end
+            
+            % 归一化磁场水平分量
+            mag_horizontal = mag_horizontal / mag_horizontal_norm;
+            
+            % 计算磁偏角（点积求夹角，叉积判断方向）
+            dot_product = dot(north_vec, mag_horizontal);
+            cross_product = north_vec(1)*mag_horizontal(2) - north_vec(2)*mag_horizontal(1);
+            mag_declination = acos(self.clamp(dot_product, -1, 1));
+            
+            % 修正角度方向（叉积符号决定正负）
+            if cross_product < 0
+                mag_declination = -mag_declination;
+            end
+        end
+        
+        %% 智能磁偏角基准更新（全新方法）
+        function update_mag_declination_reference(self, current_declination, is_stable_environment, current_state)
+            % 增强的磁偏角基准更新方法
+            % 输入：当前磁偏角、环境稳定性、当前状态
+            
+            % 参数验证
+            if isnan(current_declination) || isinf(current_declination)
+                return;
+            end
+            
+            % 环境变化检测
+            if self.detect_environment_change(self.MAG_ReferenceStrength, current_declination)
+                return;
+            end
+            
+            % 更新历史记录
+            self.update_declination_history(current_declination);
+            
+            % 计算当前稳定性指标
+            current_stability = self.calculate_declination_stability();
+            
+            % 状态感知的更新策略
+            switch current_state
+                case 'true_north'
+                    self.true_north_declination_update(current_declination, current_stability);
+                case 'fake_north'
+                    self.fake_north_declination_update(current_declination, current_stability, is_stable_environment);
+                otherwise
+                    % 不稳定状态，只更新稳定性计数
+                    self.stable_mag_count = max(0, self.stable_mag_count - 2);
+            end
+            
+            % 自适应调整更新参数
+            if self.adaptive_update_enabled
+                self.adaptive_parameter_adjustment(current_stability, current_state);
+            end
+        end
+        
+        %% 真北状态磁偏角更新（增强）
+        function true_north_declination_update(self, current_declination, stability)
+            % 真北状态：快速、高置信度更新
+            
+            self.stable_mag_count = min(self.stable_mag_count + 3, 20); % 加速计数，限制最大值
+            
+            % 动态调整更新频率基于稳定性
+            effective_interval = self.calculate_effective_interval(...
+                self.true_north_update_interval, stability, 'true_north');
+            
+            self.declination_update_counter = self.declination_update_counter + 1;
+            
+            if self.declination_update_counter >= effective_interval && self.stable_mag_count >= 8
+                % 计算自适应平滑因子
+                smooth_factor = self.calculate_adaptive_smooth_factor(stability, 'true_north');
+                
+                if self.mag_declination_reference == 0
+                    % 首次更新
+                    self.mag_declination_reference = current_declination;
+                else
+                    % 带稳定性加权的平滑更新
+                    stability_weight = min(1.0, stability * 2); % 稳定性权重
+                    effective_smooth = smooth_factor * stability_weight;
+                    
+                    self.mag_declination_reference = (1 - effective_smooth) * self.mag_declination_reference + ...
+                                                   effective_smooth * current_declination;
+                end
+                
+                self.declination_update_counter = 0;
+                self.performance_log.declination_updates = self.performance_log.declination_updates + 1;
+                
+                fprintf('真北状态-磁偏角基准更新: %.3f rad (%.1f°), 稳定性: %.3f\n', ...
+                    self.mag_declination_reference, rad2deg(self.mag_declination_reference), stability);
+            end
+        end
+        
+        %% 假北状态磁偏角更新（增强）
+        function fake_north_declination_update(self, current_declination, stability, is_stable_environment)
+            % 假北状态：谨慎、稳定性驱动的更新
+            
+            if is_stable_environment
+                self.stable_mag_count = min(self.stable_mag_count + 1, 15);
+            else
+                self.stable_mag_count = max(0, self.stable_mag_count - 1);
+            end
+            
+            % 稳定性要求更高
+            if self.stable_mag_count >= 12 && stability > 0.6
+                effective_interval = self.calculate_effective_interval(...
+                    self.declination_update_interval, stability, 'fake_north');
+                
+                self.declination_update_counter = self.declination_update_counter + 1;
+                
+                if self.declination_update_counter >= effective_interval
+                    % 更保守的平滑因子
+                    smooth_factor = self.calculate_adaptive_smooth_factor(stability, 'fake_north');
+                    
+                    if self.mag_declination_reference == 0
+                        self.mag_declination_reference = current_declination;
+                    else
+                        % 假北状态下更保守的更新
+                        stability_weight = min(0.8, stability * 1.5);
+                        effective_smooth = smooth_factor * stability_weight * 0.7; % 额外保守系数
+                        
+                        self.mag_declination_reference = (1 - effective_smooth) * self.mag_declination_reference + ...
+                                                       effective_smooth * current_declination;
+                    end
+                    
+                    self.declination_update_counter = 0;
+                    self.performance_log.declination_updates = self.performance_log.declination_updates + 1;
+                    
+                    fprintf('假北状态-磁偏角基准更新: %.3f rad (%.1f°), 稳定性: %.3f\n', ...
+                        self.mag_declination_reference, rad2deg(self.mag_declination_reference), stability);
+                end
+            end
+        end
+        
+        %% 智能磁场强度基准更新（全新方法）
+        function update_mag_strength_reference(self, current_strength, is_stable_environment, current_state)
+            % 增强的磁场强度基准更新方法
+            
+            % 参数验证
+            if isnan(current_strength) || isinf(current_strength) || current_strength < 0.1
+                return;
+            end
+            
+            % 更新历史记录
+            self.update_strength_history(current_strength);
+            
+            % 计算当前稳定性指标
+            current_stability = self.calculate_strength_stability();
+            
+            % 状态感知的更新策略
+            switch current_state
+                case 'true_north'
+                    self.true_north_strength_update(current_strength, current_stability);
+                case 'fake_north'
+                    self.fake_north_strength_update(current_strength, current_stability, is_stable_environment);
+                otherwise
+                    % 不稳定状态，只更新稳定性计数
+                    self.stable_strength_count = max(0, self.stable_strength_count - 2);
+            end
+        end
+        
+        %% 真北状态强度更新（增强）
+        function true_north_strength_update(self, current_strength, stability)
+            % 真北状态：快速更新强度基准
+            
+            self.stable_strength_count = min(self.stable_strength_count + 3, 20);
+            
+            % 基于稳定性的动态间隔
+            effective_interval = self.calculate_effective_interval(...
+                self.true_north_strength_interval, stability, 'true_north');
+            
+            self.strength_update_counter = self.strength_update_counter + 1;
+            
+            if self.strength_update_counter >= effective_interval && self.stable_strength_count >= 8
+                % 自适应平滑因子
+                smooth_factor = self.calculate_adaptive_smooth_factor(stability, 'true_north');
+                
+                if self.MAG_ReferenceStrength == 0
+                    self.MAG_ReferenceStrength = current_strength;
+                else
+                    stability_weight = min(1.0, stability * 2);
+                    effective_smooth = smooth_factor * stability_weight;
+                    
+                    self.MAG_ReferenceStrength = (1 - effective_smooth) * self.MAG_ReferenceStrength + ...
+                                              effective_smooth * current_strength;
+                end
+                
+                self.strength_update_counter = 0;
+                self.performance_log.strength_updates = self.performance_log.strength_updates + 1;
+                
+                fprintf('真北状态-磁场强度基准更新: %.4f, 稳定性: %.3f\n', ...
+                    self.MAG_ReferenceStrength, stability);
+            end
+        end
+        
+        %% 假北状态强度更新（增强）
+        function fake_north_strength_update(self, current_strength, stability, is_stable_environment)
+            % 假北状态：谨慎更新强度基准
+            
+            if is_stable_environment
+                self.stable_strength_count = min(self.stable_strength_count + 1, 15);
+            else
+                self.stable_strength_count = max(0, self.stable_strength_count - 1);
+            end
+            
+            if self.stable_strength_count >= 12 && stability > 0.6
+                effective_interval = self.calculate_effective_interval(...
+                    self.strength_update_interval, stability, 'fake_north');
+                
+                self.strength_update_counter = self.strength_update_counter + 1;
+                
+                if self.strength_update_counter >= effective_interval
+                    smooth_factor = self.calculate_adaptive_smooth_factor(stability, 'fake_north');
+                    
+                    if self.MAG_ReferenceStrength == 0
+                        self.MAG_ReferenceStrength = current_strength;
+                    else
+                        stability_weight = min(0.8, stability * 1.5);
+                        effective_smooth = smooth_factor * stability_weight * 0.7;
+                        
+                        self.MAG_ReferenceStrength = (1 - effective_smooth) * self.MAG_ReferenceStrength + ...
+                                                  effective_smooth * current_strength;
+                    end
+                    
+                    self.strength_update_counter = 0;
+                    self.performance_log.strength_updates = self.performance_log.strength_updates + 1;
+                    
+                    fprintf('假北状态-磁场强度基准更新: %.4f, 稳定性: %.3f\n', ...
+                        self.MAG_ReferenceStrength, stability);
+                end
+            end
+        end
+        
+        %% 计算有效更新间隔（新增）
+        function effective_interval = calculate_effective_interval(self, base_interval, stability, state)
+            % 基于稳定性动态调整更新间隔
+            % 稳定性越高，更新越频繁
+            
+            switch state
+                case 'true_north'
+                    % 真北状态：稳定性影响较小，主要快速更新
+                    adjustment_factor = 0.7 + (1 - stability) * 0.6; % 0.7-1.3倍
+                case 'fake_north'
+                    % 假北状态：稳定性影响较大
+                    adjustment_factor = 0.8 + (1 - stability) * 1.2; % 0.8-2.0倍
+                otherwise
+                    adjustment_factor = 1.0;
+            end
+            
+            effective_interval = max(round(base_interval * adjustment_factor), 5); % 最小5帧
+        end
+        
+        %% 计算自适应平滑因子（新增）
+        function smooth_factor = calculate_adaptive_smooth_factor(self, stability, state)
+            % 基于稳定性计算自适应平滑因子
+            % 稳定性越高，平滑因子越大（更新越快）
+            
+            switch state
+                case 'true_north'
+                    base_factor = self.true_north_smooth_factor;
+                    stability_effect = 0.5 + stability * 0.5; % 0.5-1.0倍
+                case 'fake_north'
+                    base_factor = self.declination_smooth_factor;
+                    stability_effect = 0.3 + stability * 0.7; % 0.3-1.0倍
+                otherwise
+                    base_factor = self.declination_smooth_factor;
+                    stability_effect = 0.5;
+            end
+            
+            smooth_factor = base_factor * stability_effect;
+            smooth_factor = max(self.min_smooth_factor, min(self.max_smooth_factor, smooth_factor));
+        end
+        
+        %% 更新磁偏角历史记录（新增）
+        function update_declination_history(self, current_declination)
+            % 维护磁偏角历史记录用于稳定性计算
+            
+            self.declination_history = [self.declination_history, current_declination];
+            
+            % 限制历史记录长度
+            if length(self.declination_history) > self.max_declination_history
+                self.declination_history = self.declination_history(end-self.max_declination_history+1:end);
+            end
+            
+            % 更新方差估计
+            if length(self.declination_history) >= 3
+                self.declination_variance = var(self.declination_history);
+            end
+        end
+        
+        %% 更新强度历史记录（新增）
+        function update_strength_history(self, current_strength)
+            % 维护磁场强度历史记录用于稳定性计算
+            
+            self.strength_history = [self.strength_history, current_strength];
+            
+            % 限制历史记录长度
+            if length(self.strength_history) > self.max_strength_history
+                self.strength_history = self.strength_history(end-self.max_strength_history+1:end);
+            end
+            
+            % 更新方差估计
+            if length(self.strength_history) >= 3
+                self.strength_variance = var(self.strength_history);
+            end
+        end
+        
+        %% 计算磁偏角稳定性（新增）
+        function stability = calculate_declination_stability(self)
+            % 基于历史方差计算磁偏角稳定性指标
+            % 返回0-1的值，1表示最稳定
+            
+            if isempty(self.declination_history) || length(self.declination_history) < 3
+                stability = 0.5; % 默认中等稳定性
+                return;
+            end
+            
+            % 基于方差的稳定性计算
+            base_stability = max(0, 1 - (self.declination_variance / 0.1)); % 假设0.1为最大可接受方差
+            
+            % 考虑历史记录长度的置信度
+            confidence = min(1.0, length(self.declination_history) / 10);
+            
+            stability = base_stability * confidence;
+            stability = max(0, min(1, stability));
+        end
+        
+        %% 计算强度稳定性（新增）
+        function stability = calculate_strength_stability(self)
+            % 基于历史方差计算磁场强度稳定性指标
+            
+            if isempty(self.strength_history) || length(self.strength_history) < 3
+                stability = 0.5;
+                return;
+            end
+            
+            % 基于方差的稳定性计算
+            base_stability = max(0, 1 - (self.strength_variance / 0.05)); % 假设0.05为最大可接受方差
+            
+            % 考虑历史记录长度的置信度
+            confidence = min(1.0, length(self.strength_history) / 10);
+            
+            stability = base_stability * confidence;
+            stability = max(0, min(1, stability));
+        end
+        
+        %% 自适应参数调整（新增）
+        function adaptive_parameter_adjustment(self, current_stability, current_state)
+            % 基于长期稳定性自适应调整参数
+            
+            persistent long_term_stability;
+            if isempty(long_term_stability)
+                long_term_stability = 0.7;
+            end
+            
+            % 更新长期稳定性估计
+            long_term_stability = 0.95 * long_term_stability + 0.05 * current_stability;
+            
+            % 基于长期稳定性调整基础参数
+            if long_term_stability > 0.8
+                % 高稳定性环境：更积极的更新
+                self.declination_smooth_factor = min(0.03, 0.02 * (1 + (long_term_stability - 0.8) * 2));
+                self.strength_smooth_factor = min(0.03, 0.02 * (1 + (long_term_stability - 0.8) * 2));
+                self.performance_log.stability_improvements = self.performance_log.stability_improvements + 1;
+            elseif long_term_stability < 0.4
+                % 低稳定性环境：更保守的更新
+                self.declination_smooth_factor = max(0.008, 0.02 * long_term_stability);
+                self.strength_smooth_factor = max(0.008, 0.02 * long_term_stability);
+            end
+            
+            self.performance_log.adaptive_updates = self.performance_log.adaptive_updates + 1;
+        end
+        
+        %% 改进的磁场强度归一化偏差计算（增强）
+        function strength_bias = calculate_mag_strength_bias(self, current_strength)
+            % 增强的磁场强度偏差计算，考虑基准稳定性
+            
+            if self.MAG_ReferenceStrength < 1e-6
+                strength_bias = 1;
+                return;
+            end
+            
+            % 基础相对偏差
+            relative_bias = abs(current_strength - self.MAG_ReferenceStrength) / self.MAG_ReferenceStrength;
+            
+            % 考虑基准稳定性的加权偏差
+            strength_stability = self.calculate_strength_stability();
+            confidence_weight = 0.5 + strength_stability * 0.5; % 0.5-1.0
+            
+            strength_bias = relative_bias * confidence_weight;
+            strength_bias = min(strength_bias, 1.0);
+        end
+        
+        %% 环境变化检测（新增）
+        function environment_changed = detect_environment_change(self, current_strength, current_declination)
+            % 检测是否发生了显著的环境变化
+            % 返回true表示环境发生变化
+            
+            environment_changed = false;
+            
+            % 强度变化检测
+            if self.MAG_ReferenceStrength > 1e-6
+                strength_change = abs(current_strength - self.MAG_ReferenceStrength) / self.MAG_ReferenceStrength;
+                if strength_change > 0.3 % 30%的变化
+                    environment_changed = true;
+                    fprintf('检测到磁场强度显著变化: %.1f%%，重置基准历史\n', strength_change * 100);
+                    self.reset_baseline_history();
+                end
+            end
+            
+            % 磁偏角变化检测
+            if self.mag_declination_reference ~= 0
+                declination_change = abs(current_declination - self.mag_declination_reference);
+                if declination_change > deg2rad(15) % 15度变化
+                    environment_changed = true;
+                    fprintf('检测到磁偏角显著变化: %.1f°，重置基准历史\n', rad2deg(declination_change));
+                    self.reset_baseline_history();
+                end
+            end
+        end
+        
+        %% 重置基准历史（新增，用于环境切换）
+        function reset_baseline_history(self)
+            % 在检测到环境显著变化时调用
+            self.declination_history = [];
+            self.strength_history = [];
+            self.stable_mag_count = 0;
+            self.stable_strength_count = 0;
+            self.declination_variance = 0;
+            self.strength_variance = 0;
+            fprintf('双基准历史已重置，准备适应新环境\n');
+        end
+        
+        %% 判断磁场环境是否稳定
+        function is_stable = is_magnetic_environment_stable(self, jiaom, jiaom_mag, bx_diff, by_diff, bz_diff, module_diff, strength_bias)
+            % 使用固定阈值判断磁场环境是否稳定
+            % 返回：is_stable（true=稳定，false=不稳定）
+            
+            passed_conditions = 0;
+            total_conditions = 0;
+            
+            % 检查每个参数是否在阈值范围内
+            if ~isnan(jiaom)
+                total_conditions = total_conditions + 1;
+                if jiaom <= self.fixed_threshold.jiaom * 0.8  % 更严格的条件
+                    passed_conditions = passed_conditions + 1;
+                end
+            end
+            
+            if ~isnan(jiaom_mag)
+                total_conditions = total_conditions + 1;
+                if jiaom_mag <= self.fixed_threshold.jiaom_mag * 0.8
+                    passed_conditions = passed_conditions + 1;
+                end
+            end
+            
+            if ~isnan(bx_diff)
+                total_conditions = total_conditions + 1;
+                if bx_diff <= self.fixed_threshold.bx * 0.8
+                    passed_conditions = passed_conditions + 1;
+                end
+            end
+            
+            if ~isnan(by_diff)
+                total_conditions = total_conditions + 1;
+                if by_diff <= self.fixed_threshold.by * 0.8
+                    passed_conditions = passed_conditions + 1;
+                end
+            end
+            
+            if ~isnan(bz_diff)
+                total_conditions = total_conditions + 1;
+                if bz_diff <= self.fixed_threshold.bz * 0.8
+                    passed_conditions = passed_conditions + 1;
+                end
+            end
+            
+            if ~isnan(module_diff)
+                total_conditions = total_conditions + 1;
+                if module_diff <= self.fixed_threshold.module * 0.8
+                    passed_conditions = passed_conditions + 1;
+                end
+            end
+            
+            if ~isnan(strength_bias)
+                total_conditions = total_conditions + 1;
+                if strength_bias <= self.fixed_threshold.strength * 0.8
+                    passed_conditions = passed_conditions + 1;
+                end
+            end
+            
+            % 判断逻辑：通过的条件数超过总条件数的80%
+            if total_conditions > 0
+                pass_ratio = passed_conditions / total_conditions;
+                is_stable = (pass_ratio >= 0.8);
+            else
+                is_stable = false;
+            end
+        end
+        
+        %% 固定阈值可信度判断
+        function [trust_flag, passed_conditions] = fixed_threshold_check(self, jiaom, jiaom_mag, bx_diff, by_diff, bz_diff, module_diff, strength_bias)
+            % 使用固定阈值判断磁力计是否可信
+            % 返回：trust_flag（1=可信，0=不可信），passed_conditions（通过的 condition 数量）
+            
+            passed_conditions = 0;
+            total_conditions = 0;
+            
+            % 检查每个参数是否在阈值范围内
+            conditions = [];
+            
+            if ~isnan(jiaom)
+                total_conditions = total_conditions + 1;
+                if jiaom <= self.fixed_threshold.jiaom
+                    passed_conditions = passed_conditions + 1;
+                    conditions.jiaom = true;
+                else
+                    conditions.jiaom = false;
+                end
+            end
+            
+            if ~isnan(jiaom_mag)
+                total_conditions = total_conditions + 1;
+                if jiaom_mag <= self.fixed_threshold.jiaom_mag
+                    passed_conditions = passed_conditions + 1;
+                    conditions.jiaom_mag = true;
+                else
+                    conditions.jiaom_mag = false;
+                end
+            end
+            
+            if ~isnan(bx_diff)
+                total_conditions = total_conditions + 1;
+                if bx_diff <= self.fixed_threshold.bx
+                    passed_conditions = passed_conditions + 1;
+                    conditions.bx = true;
+                else
+                    conditions.bx = false;
+                end
+            end
+            
+            if ~isnan(by_diff)
+                total_conditions = total_conditions + 1;
+                if by_diff <= self.fixed_threshold.by
+                    passed_conditions = passed_conditions + 1;
+                    conditions.by = true;
+                else
+                    conditions.by = false;
+                end
+            end
+            
+            if ~isnan(bz_diff)
+                total_conditions = total_conditions + 1;
+                if bz_diff <= self.fixed_threshold.bz
+                    passed_conditions = passed_conditions + 1;
+                    conditions.bz = true;
+                else
+                    conditions.bz = false;
+                end
+            end
+            
+            if ~isnan(module_diff)
+                total_conditions = total_conditions + 1;
+                if module_diff <= self.fixed_threshold.module
+                    passed_conditions = passed_conditions + 1;
+                    conditions.module = true;
+                else
+                    conditions.module = false;
+                end
+            end
+            
+            if ~isnan(strength_bias)
+                total_conditions = total_conditions + 1;
+                if strength_bias <= self.fixed_threshold.strength
+                    passed_conditions = passed_conditions + 1;
+                    conditions.strength = true;
+                else
+                    conditions.strength = false;
+                end
+            end
+            
+            % 判断逻辑：通过的条件数超过总条件数的一半，且关键条件满足
+            if total_conditions > 0
+                pass_ratio = passed_conditions / total_conditions;
+                
+                % 关键条件检查（水平分量和方向）
+                key_conditions_ok = true;
+                if isfield(conditions, 'bx') && ~conditions.bx
+                    key_conditions_ok = false;
+                end
+                if isfield(conditions, 'by') && ~conditions.by
+                    key_conditions_ok = false;
+                end
+                if isfield(conditions, 'jiaom_mag') && ~conditions.jiaom_mag
+                    key_conditions_ok = false;
+                end
+                
+                trust_flag = (pass_ratio >= 0.6) && key_conditions_ok;
+            else
+                trust_flag = false;
+            end
+            
+            % 更新连续可信帧计数
+            if trust_flag
+                self.trust_frame_count = self.trust_frame_count + 1;
+                self.performance_log.fixed_threshold_pass_count = self.performance_log.fixed_threshold_pass_count + 1;
+            else
+                self.trust_frame_count = 0;
+                self.performance_log.fixed_threshold_fail_count = self.performance_log.fixed_threshold_fail_count + 1;
+            end
+        end
+        
+        %% 真北到假北的切换检测
+        function should_switch_to_fake_north = check_switch_to_fake_north(self, jiao0_2, jiao_mag_2, bz2, mag0_ss)
+            % 检查是否应该从真北状态切换到假北状态
+            should_switch_to_fake_north = false;
+            
+            % 如果当前是真北状态但条件不再满足，考虑切换到假北
+            if strcmp(self.current_state, 'true_north')
+                true_north_conditions = [
+                    (jiao0_2 < 0.15) && (jiao_mag_2 < 0.08) && (abs(bz2 - self.MAG_Z0) < 0.0725) && (abs(mag0_ss - self.MAG_InitialModule) < 0.07), ...
+                    (jiao0_2 < 0.1) && (abs(bz2 - self.MAG_Z0) < 0.05) && (abs(mag0_ss - self.MAG_InitialModule) < 0.05)
+                ];
+                
+                % 如果所有真北条件都不满足
+                if ~any(true_north_conditions)
+                    should_switch_to_fake_north = true;
+                    fprintf('真北条件不满足，准备切换到假北状态\n');
+                end
+            end
+            
+            return;
+        end
+        
+        %% 假北到真北的切换检测
+        function should_switch_to_true_north = check_switch_to_true_north(self, jiao0_2, jiao_mag_2, bz2, mag0_ss, MagModelStatus)
+            % 检查是否应该从假北状态切换回真北状态
+            should_switch_to_true_north = false;
+            
+            % 如果当前是假北状态但真北条件重新满足
+            if strcmp(self.current_state, 'fake_north')
+                % 使用新的条件：假北转真北的条件更宽松
+                true_north_conditions = ...
+                    (((jiao0_2 < 0.18) && (jiao_mag_2 < 0.15) && (abs(bz2 - self.MAG_Z0) < 0.08) && (abs(mag0_ss - self.MAG_InitialModule) < 0.08)) ...
+                    || ((jiao0_2 < 0.1) && (abs(bz2 - self.MAG_Z0) < 0.05) && (abs(mag0_ss - self.MAG_InitialModule) < 0.05))) ...
+                    && (mag0_ss < 0.5) && (mag0_ss > 0.15) && MagModelStatus == 1;
+                
+                % 额外要求：假北已经稳定一段时间
+                stable_condition = self.trust_frame_count >= self.fixed_threshold.trust_count;
+                
+                if true_north_conditions && stable_condition
+                    should_switch_to_true_north = true;
+                    fprintf('真北条件重新满足，准备切换回真北状态\n');
+                end
+            end
+            
+            return;
+        end
+        
+        %% 数值钳位辅助函数
+        function clamped_val = clamp(self, val, min_val, max_val)
+            clamped_val = max(min(val, max_val), min_val);
+        end
+        
+        %% 主滤波函数
+        function q_out = KalmanFilter(self, acc_mcu, gyr_mcu, mag_mcu, dtTime)
+            % 异常帧处理（传感器数据为0）
+            if all(acc_mcu==0) || all(mag_mcu==0)
+                disp('acc || mag 都为0（异常帧）');
+                q_out = zeros(1,4);
+                self.current_state_code = 2; % 异常帧标记为不稳定
+                self.state_history = [self.state_history, self.current_state_code];
+                % 异常帧参数：trust_flag=0，其他参数标记为NaN
+                self.state_params_history.jiao0_2 = [self.state_params_history.jiao0_2, NaN];
+                self.state_params_history.jiao_mag_2 = [self.state_params_history.jiao_mag_2, NaN];
+                self.state_params_history.bz2 = [self.state_params_history.bz2, NaN];
+                self.state_params_history.mag0_ss = [self.state_params_history.mag0_ss, NaN];
+                self.state_params_history.jiaom = [self.state_params_history.jiaom, NaN];
+                self.state_params_history.jiaom_mag = [self.state_params_history.jiaom_mag, NaN];
+                self.state_params_history.bx_diff = [self.state_params_history.bx_diff, NaN];
+                self.state_params_history.by_diff = [self.state_params_history.by_diff, NaN];
+                self.state_params_history.bz_diff = [self.state_params_history.bz_diff, NaN];
+                self.state_params_history.module_diff = [self.state_params_history.module_diff, NaN];
+                self.state_params_history.strength_bias = [self.state_params_history.strength_bias, NaN];
+                self.state_params_history.trust_flag = [self.state_params_history.trust_flag, 0];
+                self.state_params_history.mag_declination = [self.state_params_history.mag_declination, NaN];
+                self.state_params_history.timestamp = [self.state_params_history.timestamp, NaN];
+                return;
+            end
+
+            g = 9.8;
+            MagModelStatus = 1;
+            self.Jiao_ACC = 0;
+            eye4 = eye(4);
+            acc = acc_mcu;
+            gyr = gyr_mcu;
+            mag = mag_mcu;
+            acc_update = 0;
+            FixMAG = 0;
+
+            % 数据预处理
+            mag0_s = sum(mag.*mag);
+            mag0_ss = sqrt(mag0_s);
+            acc0_s = sum(acc.*acc);
+            acc0_ss = sqrt(acc0_s);
+            gyr0_s = sum(gyr.*gyr);
+            gyrErr = sqrt(gyr0_s);
+            accErr = abs(acc0_ss - g);
+
+            if acc0_ss ~= 0
+                acc = acc / acc0_ss;
+            end
+            if mag0_s > 0
+                mag = mag / mag0_ss;
+            end
+
+            % ========== 初始化/校准阶段 ==========
+            if self.k_first <= 0.1
+                if accErr < 0.5 && gyrErr < 0.5
+                    self.k_first = self.k_first + dtTime;
+                else
+                    self.k_first = 0;
+                    self.InitNumber = 1;
+                    self.MAG_Fa0 = zeros(1,3);
+                    self.MeanACC = zeros(1,3);
+                    self.MeanMAG = zeros(1,3);
+                    self.MAG_InitialModule = 0;
+                    self.MAG_ReferenceStrength = 0;
+                    self.X_ACC_EKF = zeros(1,3);
+                    self.X_MAG_EKF = [0,0,0,0,0,0];
+                    self.MAG_MOm_xy = zeros(1,2);
+                    % 重置磁偏角相关参数
+                    self.mag_declination_reference = 0;
+                    self.declination_update_counter = 0;
+                    self.stable_mag_count = 0;
+                    % 重置强度相关参数
+                    self.strength_update_counter = 0;
+                    self.stable_strength_count = 0;
+                end
+                self.ekf_init();
+
+                % 累加均值
+                for ii = 1:3
+                    self.MeanACC(ii) = ((self.InitNumber-1)*self.MeanACC(ii) + acc(ii)) / self.InitNumber;
+                    self.MeanMAG(ii) = ((self.InitNumber-1)*self.MeanMAG(ii) + mag(ii)) / self.InitNumber;
+                    self.MAG_InitialModule = ((self.InitNumber - 1)*self.MAG_InitialModule + mag0_ss) / self.InitNumber;
+                end
+                % 新增：设置磁场强度基准
+                self.MAG_ReferenceStrength = self.MAG_InitialModule;
+
+                self.X_ACC_EKF = acc_mcu;
+                self.X_MAG_EKF = [mag, zeros(1,3)];
+
+                % 初始四元数
+                PRY(1) = atan2(self.MeanACC(2), self.MeanACC(3));
+                PRY(2) = atan2(-self.MeanACC(1), sqrt(self.MeanACC(2)^2 + self.MeanACC(3)^2));
+                PRY(3) = atan2( ...
+                    (self.MeanMAG(3)*sin(PRY(1)) - self.MeanMAG(2)*cos(PRY(1))), ...
+                    (self.MeanMAG(1)*cos(PRY(2)) + (self.MeanMAG(2)*sin(PRY(1)) + self.MeanMAG(3)*cos(PRY(1))) * sin(PRY(2))) ...
+                );
+                self.quat_EKF = [cos(0.5*PRY(1))*cos(0.5*PRY(2))*cos(0.5*PRY(3)) + sin(0.5*PRY(1))*sin(0.5*PRY(2))*sin(0.5*PRY(3)), ...
+                                 sin(0.5*PRY(1))*cos(0.5*PRY(2))*cos(0.5*PRY(3)) - cos(0.5*PRY(1))*sin(0.5*PRY(2))*sin(0.5*PRY(3)), ...
+                                 cos(0.5*PRY(1))*sin(0.5*PRY(2))*cos(0.5*PRY(3)) + sin(0.5*PRY(1))*cos(0.5*PRY(2))*sin(0.5*PRY(3)), ...
+                                 cos(0.5*PRY(1))*cos(0.5*PRY(2))*sin(0.5*PRY(3)) - sin(0.5*PRY(1))*sin(0.5*PRY(2))*cos(0.5*PRY(3))];
+
+                m_n = self.MeanMAG * T_SY(self.quat_EKF)';
+                bx = sqrt(m_n(1)^2 + m_n(2)^2);
+                by = 0;
+                bz = m_n(3);
+                self.MAG_Fa0 = [bx, by, bz]/module([bx, by, bz]);
+                self.MAG_MO0 = self.MAG_Fa0;
+                self.MAG_Fam = self.MAG_Fa0;
+                self.MAG_MOm = m_n;
+                self.MAG_MOm_xy = m_n(1:2);
+                self.MAG_Z0 = bz;
+                self.MAG_LastTrue = 1;
+                self.quat_Filter = self.quat_EKF;
+                self.quat_GYR = self.quat_EKF;
+                q_out = self.quat_EKF;
+                self.t_a = 0;
+                self.t_m = 0.015;
+                self.InitNumber = self.InitNumber + 1;
+                self.EnvironmentMagStatus = 2.1;
+                self.QuitReturnCtrlNumber = 0;
+                self.QuickRecover = 0;
+                self.gyr_vec_flag = 0;
+                self.accLast = acc_mcu;
+                self.acc_EKF = acc_mcu;
+                self.MAG_InitialModule_m = self.MAG_InitialModule;
+                self.current_state = 'true_north';
+                self.current_state_code = 0;
+                self.prev_state = self.current_state;
+                % 初始化阶段参数：trust_flag=1
+                self.state_history = [self.state_history, self.current_state_code];
+                self.state_params_history.jiao0_2 = [self.state_params_history.jiao0_2, 0];
+                self.state_params_history.jiao_mag_2 = [self.state_params_history.jiao_mag_2, 0];
+                self.state_params_history.bz2 = [self.state_params_history.bz2, bz];
+                self.state_params_history.mag0_ss = [self.state_params_history.mag0_ss, mag0_ss];
+                self.state_params_history.jiaom = [self.state_params_history.jiaom, 0];
+                self.state_params_history.jiaom_mag = [self.state_params_history.jiaom_mag, 0];
+                self.state_params_history.bx_diff = [self.state_params_history.bx_diff, 0];
+                self.state_params_history.by_diff = [self.state_params_history.by_diff, 0];
+                self.state_params_history.bz_diff = [self.state_params_history.bz_diff, 0];
+                self.state_params_history.module_diff = [self.state_params_history.module_diff, 0];
+                self.state_params_history.strength_bias = [self.state_params_history.strength_bias, 0];
+                self.state_params_history.trust_flag = [self.state_params_history.trust_flag, 1];
+                self.state_params_history.mag_declination = [self.state_params_history.mag_declination, 0];
+                self.state_params_history.timestamp = [self.state_params_history.timestamp, self.k_first];
+                return;
+            end
+
+            % ========== 预测阶段（所有状态通用）==========
+            if gyrErr > 0.04 && dtTime < 0.1
+                % 加速度计预测
+                A_ACC = [1, -gyr(3)*dtTime, gyr(2)*dtTime; ...
+                         gyr(3)*dtTime, 1, -gyr(1)*dtTime; ...
+                        -gyr(2)*dtTime, gyr(1)*dtTime, 1];
+                self.X_ACC_EKF = self.X_ACC_EKF * A_ACC;
+                self.P_ACC_EKF = A_ACC' * self.P_ACC_EKF * A_ACC + self.Q_ACC_EKF;
+
+                % 磁力计预测（仅真北和假北状态）
+                if strcmp(self.current_state, 'true_north') || strcmp(self.current_state, 'fake_north')
+                    self.gyr_vec_flag = 0;
+                    A_MAG_EKF = eye(6);
+                    A_MAG_EKF(1:3,1:3) = eye(3) + [0, -gyr(3), gyr(2); gyr(3), 0, -gyr(1); -gyr(2), gyr(1), 0] * dtTime;
+                    self.X_MAG_EKF(1:3) = self.X_MAG_EKF(1:3) * A_ACC;
+                    self.P_MAG_EKF = A_MAG_EKF' * self.P_MAG_EKF * A_MAG_EKF + self.Q_MAG_EKF;
+                end
+
+                % 四元数预测（所有状态都基于陀螺仪积分）
+                A = w_matrix([1, gyr*dtTime*0.5], 1);
+                self.quat_EKF = self.quat_EKF * A';
+                self.quat_EKF = self.Norm(self.quat_EKF);
+                self.quat_Filter = self.quat_Filter * A';
+                self.quat_Filter = self.Norm(self.quat_Filter);
+                self.quat_GYR = self.quat_GYR * A';
+                self.quat_GYR = self.Norm(self.quat_GYR);
+                self.P_EKF = A * self.P_EKF * A' + self.Q;
+                temp = 100;
+                self.P_EKF(self.P_EKF > temp) = temp;
+                self.P_EKF(self.P_EKF < -temp) = -temp;
+            end
+
+            % ========== 加速度计更新（所有状态通用）==========
+            self.t_a = self.t_a + dtTime;
+            if self.t_a > 0.03 && accErr < 0.5
+                self.t_a = self.t_a - 0.03;
+                acc_update = 1;
+                self.accLast = acc;
+                float_temp = max(gyrErr, accErr)^2 + 1e-4;
+                self.MAXERR = max([float_temp, self.ERR_ACC_EKF1, self.ERR_ACC_EKF2, self.ERR_ACC_EKF3]);
+                self.ERR_ACC_EKF3 = self.ERR_ACC_EKF2;
+                self.ERR_ACC_EKF2 = self.ERR_ACC_EKF1;
+                self.ERR_ACC_EKF1 = float_temp;
+
+                if accErr < 2
+                    mid = self.R_ACC_EKF * self.MAXERR;
+                    K_ACC = self.P_ACC_EKF / (self.P_ACC_EKF + mid);
+                    mid = acc_mcu - self.X_ACC_EKF;
+                    self.X_ACC_EKF = self.X_ACC_EKF + mid * K_ACC';
+                    self.P_ACC_EKF = (eye(3) - K_ACC) * self.P_ACC_EKF;
+                end
+                self.acc_EKF = self.X_ACC_EKF / module(self.X_ACC_EKF);
+                
+                % 性能统计
+                self.performance_log.acc_fix_count = self.performance_log.acc_fix_count + 1;
+                self.performance_log.avg_acc_error = ...
+                    (self.performance_log.avg_acc_error * (self.performance_log.acc_fix_count - 1) + accErr) / ...
+                    self.performance_log.acc_fix_count;
+            end
+
+            % ========== 加速度计修正四元数（所有状态通用）==========
+            acc_T = [2*(self.quat_EKF(2)*self.quat_EKF(4) - self.quat_EKF(1)*self.quat_EKF(3)), ...
+                     2*(self.quat_EKF(3)*self.quat_EKF(4) + self.quat_EKF(1)*self.quat_EKF(2)), ...
+                     self.quat_EKF(1)^2 - self.quat_EKF(2)^2 - self.quat_EKF(3)^2 + self.quat_EKF(4)^2];
+            if acc0_ss > 0
+                self.Jiao_ACC = self.ACos(dot(self.acc_EKF, acc_T));
+            else
+                self.Jiao_ACC = 100;
+            end
+
+            if acc_update == 1 || self.sensorQuitReturnCtrl == 1
+                % 误差累积计数
+                if accErr > 10 && gyrErr > 10
+                    self.QuitReturnCtrlNumber = self.QuitReturnCtrlNumber + 0.1;
+                elseif accErr < 0.8 && gyrErr < 0.5
+                    if self.Jiao_ACC > 0.4
+                        self.QuitReturnCtrlNumber = self.QuitReturnCtrlNumber + 0.1;
+                    else
+                        self.QuitReturnCtrlNumber = self.QuitReturnCtrlNumber - 0.02;
+                    end
+                elseif accErr < 2 && gyrErr < 1
+                    self.QuitReturnCtrlNumber = self.QuitReturnCtrlNumber - 0.02;
+                end
+                self.QuitReturnCtrlNumber = max(0, self.QuitReturnCtrlNumber);
+                
+                % 快速恢复逻辑
+                if (self.QuitReturnCtrlNumber > 10 || self.sensorQuitReturnCtrl == 1) && accErr < 0.8 && gyrErr < 0.5
+                    self.QuickRecover = 1;
+                    self.quat_Filter = self.quat_EKF;  % 直接同步
+                end
+            end
+
+            if acc_update == 1
+                % 加速度计修正条件
+                if ((accErr < 1 && gyrErr < 1 && self.Jiao_ACC < 0.5) || (accErr < 0.5 && gyrErr < 0.2))
+                    % 增益计算
+                    if accErr < 0.2 && gyrErr < 0.2
+                        k_a = 1 + 10 * abs(acc0_s - g^2);
+                    elseif accErr < 0.5 && gyrErr < 0.5
+                        k_a = 1 + 50 * abs(acc0_s - g^2);
+                    else
+                        k_a = 1 + 100 * abs(acc0_s - g^2) * (1 + self.Jiao_ACC*20);
+                    end
+                    self.Racc_use = k_a * self.Racc_static;
+
+                    H1 = 2*[-self.quat_EKF(3), self.quat_EKF(4), -self.quat_EKF(1), self.quat_EKF(2); ...
+                             self.quat_EKF(2), self.quat_EKF(1), self.quat_EKF(4), self.quat_EKF(3); ...
+                             self.quat_EKF(1), -self.quat_EKF(2), -self.quat_EKF(3), self.quat_EKF(4)];
+                    K1 = self.P_EKF * H1' / (H1 * self.P_EKF * H1' + self.Racc_use);
+
+                    mid1 = self.acc_EKF - acc_T;
+                    dist_ACC1 = sum(mid1.^2);
+                    temp = sqrt(dist_ACC1);
+                    Ryu = 0.08;
+                    if temp > Ryu
+                        mid1 = mid1 * Ryu / temp;
+                    end
+
+                    mid2 = mid1 * K1';
+                    qtemp = self.Norm(self.quat_EKF + mid2);
+
+                    % 双方向修正检验
+                    acc_T_new = [2*(qtemp(2)*qtemp(4) - qtemp(1)*qtemp(3)), ...
+                                 2*(qtemp(3)*qtemp(4) + qtemp(1)*qtemp(2)), ...
+                                 1 - 2*qtemp(2)^2 - 2*qtemp(3)^2];
+                    dist_ACC2 = sum((self.acc_EKF - acc_T_new).^2);
+
+                    qtemp2 = self.Norm(self.quat_EKF - mid2);
+                    acc_T_new2 = [2*(qtemp2(2)*qtemp2(4) - qtemp2(1)*qtemp2(3)), ...
+                                  2*(qtemp2(3)*qtemp2(4) + qtemp2(1)*qtemp2(2)), ...
+                                  1 - 2*qtemp2(2)^2 - 2*qtemp2(3)^2];
+                    dist_ACC3 = sum((self.acc_EKF - acc_T_new2).^2);
+
+                    if dist_ACC2 < dist_ACC3 && dist_ACC1 > dist_ACC2
+                        self.quat_EKF = qtemp;
+                        self.P_EKF = (eye4 - K1*H1) * self.P_EKF;
+                    elseif dist_ACC1 > dist_ACC3
+                        self.quat_EKF = qtemp2;
+                        self.P_EKF = (eye4 + K1*H1) * self.P_EKF;
+                    end
+                end
+            end
+
+            % ========== 磁力计处理与状态判断 ==========
+            self.t_m = self.t_m + dtTime;
+            % 初始化当前帧参数变量
+            current_jiao0_2 = NaN;
+            current_jiao_mag_2 = NaN;
+            current_bz2 = NaN;
+            current_mag0_ss = mag0_ss;
+            current_jiaom = NaN;
+            current_jiaom_mag = NaN;
+            current_bx_diff = NaN;
+            current_by_diff = NaN;
+            current_bz_diff = NaN;
+            current_module_diff = NaN;
+            current_strength_bias = NaN;
+            current_trust_flag = 0;
+            current_mag_declination = NaN;
+            
+            if self.t_m > 0.03
+                if gyrErr > 0.04
+                    m_n2 = mag * T_SY(self.quat_EKF)';
+                    bx2 = sqrt(m_n2(1)^2 + m_n2(2)^2);
+                    bz2 = m_n2(3);
+                    Fam2 = [bx2, 0, bz2]/module([bx2, 0, bz2]);
+                    jiao_mag_2 = abs(atan2(m_n2(2), m_n2(1)));
+                    jiao0_2 = self.ACos(dot(Fam2([1,3]), self.MAG_Fa0([1,3])));
+                    % 赋值当前帧真北判断参数
+                    current_jiao0_2 = jiao0_2;
+                    current_jiao_mag_2 = jiao_mag_2;
+                    current_bz2 = bz2;
+                    
+                    k_m = 1;
+                    self.t_m = self.t_m - 0.03;
+                    self.gyr_vec_flag = self.gyr_vec_flag + 1;
+
+                    % 磁力计EKF更新（仅真北和假北状态）
+                    if self.gyr_vec_flag <= 2 && ...
+                       (strcmp(self.current_state, 'true_north') || strcmp(self.current_state, 'fake_north'))
+                        self.Rmag_use = k_m * self.R_MAG_EKF;
+                        H_MAG_EKF = [eye(3); eye(3)];
+                        K_MAG_EKF = self.P_MAG_EKF * H_MAG_EKF / (H_MAG_EKF' * self.P_MAG_EKF * H_MAG_EKF + self.Rmag_use);
+                        mid1 = self.X_MAG_EKF * H_MAG_EKF;
+                        mid = mag_mcu - mid1;
+                        self.X_MAG_EKF = self.X_MAG_EKF + mid * K_MAG_EKF';
+                        self.P_MAG_EKF = (eye(6) - K_MAG_EKF * H_MAG_EKF') * self.P_MAG_EKF;
+                    end
+
+                    % 磁力计数据处理
+                    self.mag_EKF = self.X_MAG_EKF(1:3);
+                    mag0_s_EKF = sum(self.mag_EKF .* self.mag_EKF);
+                    mag0_ss_EKF = sqrt(mag0_s_EKF);
+                    self.mag_EKF = self.Norm(self.mag_EKF);
+
+                    % 坐标转换
+                    m_n = self.mag_EKF * T_SY(self.quat_EKF)';
+                    bx = sqrt(m_n(1)^2 + m_n(2)^2);
+                    by = 0;
+                    bz = m_n(3);
+                    Fam = [bx, by, bz]/module([bx, by, bz]);
+
+                    % ========== 状态判断逻辑 ==========
+                    % 新增：状态切换检测（双向）
+                    switch_to_fake_north = false;
+                    switch_to_true_north = false;
+                    
+                    % 真北->假北切换检测
+                    if strcmp(self.current_state, 'true_north')
+                        switch_to_fake_north = self.check_switch_to_fake_north(jiao0_2, jiao_mag_2, bz2, mag0_ss);
+                        if switch_to_fake_north
+                            self.performance_log.state_switch_true_to_fake = self.performance_log.state_switch_true_to_fake + 1;
+                        end
+                    end
+                    
+                    % 假北->真北切换检测  
+                    if strcmp(self.current_state, 'fake_north')
+                        switch_to_true_north = self.check_switch_to_true_north(jiao0_2, jiao_mag_2, bz2, mag0_ss, MagModelStatus);
+                        if switch_to_true_north
+                            self.performance_log.state_switch_fake_to_true = self.performance_log.state_switch_fake_to_true + 1;
+                        end
+                    end
+                    
+                    % 1. 真北状态判断（磁力计原始有效）或从假北切换回来
+                    if ((((jiao0_2 < 0.18) && (jiao_mag_2 < 0.08) && (abs(bz2 - self.MAG_Z0) < 0.0725) && (abs(mag0_ss - self.MAG_InitialModule) < 0.07)) ...
+                        || ((jiao0_2 < 0.1) && (abs(bz2 - self.MAG_Z0) < 0.05) && (abs(mag0_ss - self.MAG_InitialModule) < 0.05))) ...
+                        && (mag0_ss < 0.5) && (mag0_ss > 0.15) && MagModelStatus == 1) ...
+                        || switch_to_true_north
+                        
+                        self.current_state = 'true_north';
+                        self.current_state_code = 0;
+                        self.performance_log.true_north_count = self.performance_log.true_north_count + 1;
+                        current_trust_flag = 1;
+                        
+                        if self.MAG_LastTrue == 0
+                            self.P_MAG_EKF = eye(6) * 1e-3;
+                        end
+                        self.MAG_LastTrue = 1;
+                        FixMAG = 1;
+                        self.MAG_MO = self.MAG_MO0;
+                        self.MAG_MOm_xy = m_n(1:2);
+                        k_m = 1 + 50 * abs(mag0_s - self.MAG_InitialModule^2);
+                        self.X_MAG_EKF(4:6) = zeros(1,3);
+                        self.trust_frame_count = self.trust_frame_count + 1;
+                        
+                        % ========== 新增：真北状态下更新磁场强度基准 ==========
+                        current_mag_strength = mag0_ss_EKF;
+                        is_stable_environment = true; % 真北状态认为是稳定环境
+                        self.update_mag_strength_reference(current_mag_strength, is_stable_environment, 'true_north');
+                        
+                        % 计算当前强度偏差
+                        strength_bias = self.calculate_mag_strength_bias(current_mag_strength);
+                        current_strength_bias = strength_bias;
+                        
+                        % ========== 新增：真北状态下也更新磁偏角基准 ==========
+                        % 计算磁偏角
+                        mag_declination = self.calculate_mag_declination(self.acc_EKF, m_n);
+                        current_mag_declination = mag_declination;
+                        
+                        % 真北状态下无条件认为是稳定环境
+                        is_stable_environment = true;
+                        
+                        % 更新磁偏角基准
+                        self.update_mag_declination_reference(mag_declination, is_stable_environment, 'true_north');
+                        
+                        % 真北状态下固定阈值参数设为NaN
+                        current_jiaom = NaN;
+                        current_jiaom_mag = NaN;
+                        current_bx_diff = NaN;
+                        current_by_diff = NaN;
+                        current_bz_diff = NaN;
+                        current_module_diff = NaN;
+
+                    % 2. 磁力计无效，进入磁偏角+磁场强度双条件判断 或 从真北切换过来
+                    else
+                        if MagModelStatus == 1 || MagModelStatus == 2 || switch_to_fake_north
+                            if self.MAG_LastTrue == 1 || switch_to_fake_north
+                                % 从真北状态切换出来
+                                self.MAG_LastTrue = 0;
+                                self.MAG_MOm = m_n;
+                                self.MAG_Fam = Fam;
+                                self.MAG_OMOm = m_n2;
+                                self.MAG_OFam = Fam2;
+                                self.MAG_Zm = bz2;
+                                self.MAG_MOm_xy = m_n(1:2);
+                                self.X_MAG_EKF(1:3) = mag_mcu;
+                                self.X_MAG_EKF(4:6) = zeros(1,3);
+                                self.P_MAG_EKF = eye(6) * 1e-3;
+                                self.MAG_InitialModule_m = mag0_ss_EKF;
+                                current_trust_flag = 0;
+                                current_strength_bias = NaN;
+                                current_mag_declination = NaN;
+                            else
+                                % 第一步：计算磁偏角（基于重力方向）
+                                mag_declination = self.calculate_mag_declination(self.acc_EKF, m_n);
+                                current_mag_declination = mag_declination;
+                                
+                                % 第二步：计算当前磁场强度
+                                current_mag_strength = mag0_ss_EKF;
+                                
+                                % 第三步：计算当前强度偏差（先计算，用于环境稳定性判断）
+                                strength_bias = self.calculate_mag_strength_bias(current_mag_strength);
+                                current_strength_bias = strength_bias;
+                                
+                                % 第四步：计算固定阈值参数（用于环境稳定性判断）
+                                jiaom = self.ACos(dot(Fam([1,3]), self.MAG_Fam([1,3])));
+                                jiaom_mag = self.ACos((dot(m_n(1:2), self.MAG_MOm(1:2)))/(Fam(1)*module(self.MAG_MOm(1:2))));
+                                bx_diff = abs(m_n(1) - self.MAG_MOm_xy(1));
+                                by_diff = abs(m_n(2) - self.MAG_MOm_xy(2));
+                                bz_diff = abs(bz2 - self.MAG_Zm);
+                                module_diff = abs(mag0_ss_EKF - self.MAG_InitialModule_m);
+                                
+                                % 赋值当前帧固定阈值判断参数
+                                current_jiaom = jiaom;
+                                current_jiaom_mag = jiaom_mag;
+                                current_bx_diff = bx_diff;
+                                current_by_diff = by_diff;
+                                current_bz_diff = bz_diff;
+                                current_module_diff = module_diff;
+                                
+                                % 第五步：判断磁场环境稳定性
+                                is_stable_environment = self.is_magnetic_environment_stable(jiaom, jiaom_mag, bx_diff, by_diff, bz_diff, module_diff, strength_bias);
+                                
+                                % 第六步：动态更新磁偏角基准
+                                self.update_mag_declination_reference(mag_declination, is_stable_environment, 'fake_north');
+                                
+                                % ========== 新增：动态更新磁场强度基准 ==========
+                                self.update_mag_strength_reference(current_mag_strength, is_stable_environment, 'fake_north');
+                                
+                                % 第七步：使用动态磁偏角基准进行判断
+                                declination_abs = abs(mag_declination - self.mag_declination_reference);
+                                
+                                % 磁偏角判断阈值（5°）+ 磁场强度偏差双条件并列校验
+                                if declination_abs <= self.declination_threshold && strength_bias <= self.strength_threshold
+                                    % 双条件都满足：判定为假北状态
+                                    self.current_state = 'fake_north';
+                                    self.current_state_code = 1;
+                                    self.performance_log.fake_north_count = self.performance_log.fake_north_count + 1;
+                                    self.performance_log.declination_accepted_count = self.performance_log.declination_accepted_count + 1;
+                                    
+                                    FixMAG = 1;
+                                    self.MAG_MO = self.MAG_MOm;
+                                    
+                                    % 固定阈值判断
+                                    [trust_flag, passed_conditions] = self.fixed_threshold_check(jiaom, jiaom_mag, bx_diff, by_diff, bz_diff, module_diff, strength_bias);
+                                    current_trust_flag = trust_flag;
+                                    
+                                    % 办公室优化的增益和平滑因子（基于磁偏角）
+                                    base_gain = 25;
+                                    module_error = abs(mag0_s_EKF - self.MAG_InitialModule_m^2);
+                                    k_m = 1 + base_gain * module_error * (1 - declination_abs/self.declination_threshold);
+                                    k_m = min(k_m, 100);
+                                    
+                                    base_smooth = 0.0015; % 固定平滑因子
+                                    smooth_factor = base_smooth * (1 - declination_abs/self.declination_threshold); % 磁偏角越小，平滑越强
+                                    smooth_factor = min(smooth_factor, 0.012);
+                                    
+                                    % 平滑更新假北基准
+                                    self.MAG_MOm = (1 - smooth_factor)*self.MAG_MOm + smooth_factor*m_n;
+                                    self.MAG_Fam = (1 - smooth_factor)*self.MAG_Fam + smooth_factor*Fam;
+                                    self.MAG_OMOm = (1 - smooth_factor)*self.MAG_OMOm + smooth_factor*m_n2;
+                                    self.MAG_OFam = (1 - smooth_factor)*self.MAG_OFam + smooth_factor*Fam2;
+                                    self.MAG_MOm_xy = (1 - smooth_factor)*self.MAG_MOm_xy + smooth_factor*m_n(1:2);
+                                    self.MAG_MOm = self.Norm(self.MAG_MOm);
+                                    self.MAG_Fam = self.Norm(self.MAG_Fam);
+                                    self.MAG_OMOm = self.Norm(self.MAG_OMOm);
+                                    self.MAG_OFam = self.Norm(self.MAG_OFam);
+                                    self.MAG_Zm = self.MAG_MOm(3);
+                                    self.MAG_InitialModule_m = (1 - smooth_factor)*self.MAG_InitialModule_m + smooth_factor*mag0_ss_EKF;
+                                    
+                                    % 性能监控
+                                    self.performance_log.mag_fix_count = self.performance_log.mag_fix_count + 1;
+                                    
+                                else
+                                    % 双条件任一不满足：进入固定阈值判断
+                                    self.performance_log.declination_rejected_count = self.performance_log.declination_rejected_count + 1;
+                                    
+                                    % 调用固定阈值判断函数
+                                    [trust_flag, passed_conditions] = self.fixed_threshold_check(jiaom, jiaom_mag, bx_diff, by_diff, bz_diff, module_diff, strength_bias);
+                                    current_trust_flag = trust_flag;
+                                    
+                                    if trust_flag && (self.trust_frame_count >= self.fixed_threshold.trust_count)
+                                        % 固定阈值判定有效：假北状态
+                                        self.current_state = 'fake_north';
+                                        self.current_state_code = 1;
+                                        self.performance_log.fake_north_count = self.performance_log.fake_north_count + 1;
+                                        
+                                        FixMAG = 1;
+                                        self.MAG_MO = self.MAG_MOm;
+                                        
+                                        base_gain = 25;
+                                        module_error = abs(mag0_s_EKF - self.MAG_InitialModule_m^2);
+                                        k_m = 1 + base_gain * module_error;
+                                        k_m = min(k_m, 100);
+                                        
+                                        base_smooth = 0.0015;
+                                        smooth_factor = base_smooth;
+                                        smooth_factor = min(smooth_factor, 0.012);
+                                        
+                                        % 平滑更新
+                                        self.MAG_MOm = (1 - smooth_factor)*self.MAG_MOm + smooth_factor*m_n;
+                                        self.MAG_Fam = (1 - smooth_factor)*self.MAG_Fam + smooth_factor*Fam;
+                                        self.MAG_OMOm = (1 - smooth_factor)*self.MAG_OMOm + smooth_factor*m_n2;
+                                        self.MAG_OFam = (1 - smooth_factor)*self.MAG_OFam + smooth_factor*Fam2;
+                                        self.MAG_MOm_xy = (1 - smooth_factor)*self.MAG_MOm_xy + smooth_factor*m_n(1:2);
+                                        self.MAG_MOm = self.Norm(self.MAG_MOm);
+                                        self.MAG_Fam = self.Norm(self.MAG_Fam);
+                                        self.MAG_OMOm = self.Norm(self.MAG_OMOm);
+                                        self.MAG_OFam = self.Norm(self.MAG_OFam);
+                                        self.MAG_Zm = self.MAG_MOm(3);
+                                        self.MAG_InitialModule_m = (1 - smooth_factor)*self.MAG_InitialModule_m + smooth_factor*mag0_ss_EKF;
+                                        
+                                        self.performance_log.mag_fix_count = self.performance_log.mag_fix_count + 1;
+                                        
+                                    else
+                                        % 固定阈值判定无效：不稳定状态
+                                        self.current_state = 'unstable';
+                                        self.current_state_code = 2;
+                                        self.performance_log.unstable_count = self.performance_log.unstable_count + 1;
+                                        
+                                        self.MAG_MOm = m_n;
+                                        self.MAG_Fam = Fam;
+                                        self.MAG_OMOm = m_n2;
+                                        self.MAG_OFam = Fam2;
+                                        self.MAG_Zm = bz2;
+                                        self.MAG_MOm_xy = m_n(1:2);
+                                        self.X_MAG_EKF(1:3) = mag_mcu;
+                                        self.X_MAG_EKF(4:6) = zeros(1,3);
+                                        self.P_MAG_EKF = eye(6) * 1e-3;
+                                        self.MAG_InitialModule_m = mag0_ss_EKF;
+                                        
+                                        % 性能监控
+                                        self.performance_log.mag_reject_count = self.performance_log.mag_reject_count + 1;
+                                    end
+                                end
+                            end
+                        else
+                            self.current_state = 'unstable';
+                            self.current_state_code = 2;
+                            self.performance_log.unstable_count = self.performance_log.unstable_count + 1;
+                            current_trust_flag = 0;
+                            current_jiaom = NaN;
+                            current_jiaom_mag = NaN;
+                            current_bx_diff = NaN;
+                            current_by_diff = NaN;
+                            current_bz_diff = NaN;
+                            current_module_diff = NaN;
+                            current_strength_bias = NaN;
+                            current_mag_declination = NaN;
+                        end
+                    end
+
+                    % ========== 磁力计修正四元数（仅真北和假北状态）==========
+                    if FixMAG == 1 && (strcmp(self.current_state, 'true_north') || strcmp(self.current_state, 'fake_north'))
+                        self.Rmag_use = k_m * self.Rmag_static;
+                        H2 = 2*[...
+                            self.MAG_MO(1)*self.quat_EKF(1) + self.MAG_MO(2)*self.quat_EKF(4) - self.MAG_MO(3)*self.quat_EKF(3), ...
+                            self.MAG_MO(1)*self.quat_EKF(2) + self.MAG_MO(2)*self.quat_EKF(3) + self.MAG_MO(3)*self.quat_EKF(4), ...
+                           -self.MAG_MO(1)*self.quat_EKF(3) + self.MAG_MO(2)*self.quat_EKF(2) - self.MAG_MO(3)*self.quat_EKF(1), ...
+                           -self.MAG_MO(1)*self.quat_EKF(4) + self.MAG_MO(2)*self.quat_EKF(1) + self.MAG_MO(3)*self.quat_EKF(2); ...
+                           -self.MAG_MO(1)*self.quat_EKF(4) + self.MAG_MO(2)*self.quat_EKF(1) + self.MAG_MO(3)*self.quat_EKF(2), ...
+                            self.MAG_MO(1)*self.quat_EKF(3) - self.MAG_MO(2)*self.quat_EKF(2) + self.MAG_MO(3)*self.quat_EKF(1), ...
+                            self.MAG_MO(1)*self.quat_EKF(2) + self.MAG_MO(2)*self.quat_EKF(3) + self.MAG_MO(3)*self.quat_EKF(4), ...
+                           -self.MAG_MO(1)*self.quat_EKF(1) - self.MAG_MO(2)*self.quat_EKF(4) + self.MAG_MO(3)*self.quat_EKF(3); ...
+                            self.MAG_MO(1)*self.quat_EKF(3) - self.MAG_MO(2)*self.quat_EKF(2) + self.MAG_MO(3)*self.quat_EKF(1), ...
+                            self.MAG_MO(1)*self.quat_EKF(4) - self.MAG_MO(2)*self.quat_EKF(1) - self.MAG_MO(3)*self.quat_EKF(2), ...
+                            self.MAG_MO(1)*self.quat_EKF(1) + self.MAG_MO(2)*self.quat_EKF(4) - self.MAG_MO(3)*self.quat_EKF(3), ...
+                            self.MAG_MO(1)*self.quat_EKF(2) + self.MAG_MO(2)*self.quat_EKF(3) + self.MAG_MO(3)*self.quat_EKF(4) ...
+                        ];
+
+                        K2 = self.P_EKF * H2' / (H2 * self.P_EKF * H2' + self.Rmag_use);
+                        self.P_EKF = (eye4 - K2 * H2) * self.P_EKF;
+
+                        mid1 = self.MAG_MO * T_SY(self.quat_EKF);
+                        mid2 = self.mag_EKF - mid1;
+                        delta_q = mid2 * K2';
+
+                        q_temp = self.Norm(self.quat_EKF + delta_q);
+                        mid = w_matrix(self.quat_EKF, 1);
+                        q_temp2 = self.Norm(q_temp * mid);
+                        q_temp2(2:3) = 0;
+                        self.quat_EKF = self.Norm(q_temp2 * mid');
+                    end
+                else
+                    self.t_m = self.t_m - 0.03;
+                    % 陀螺仪误差小时，状态设为不稳定
+                    self.current_state = 'unstable';
+                    self.current_state_code = 2;
+                    current_jiao0_2 = 4;
+                    current_jiao_mag_2 = 4;
+                    current_bz2 = 4;
+                    current_jiaom = 4;
+                    current_jiaom_mag = 4;
+                    current_bx_diff = 4;
+                    current_by_diff = 4;
+                    current_bz_diff = 4;
+                    current_module_diff = 4;
+                    current_strength_bias = 4;
+                    current_trust_flag = 0;
+                    current_mag_declination = NaN;
+                end
+            else
+                % 磁力计未到更新时间，沿用前一帧trust_flag
+                if ~isempty(self.state_params_history.trust_flag)
+                    current_trust_flag = self.state_params_history.trust_flag(end);
+                    current_mag_declination = self.state_params_history.mag_declination(end);
+                    current_strength_bias = self.state_params_history.strength_bias(end);
+                else
+                    current_trust_flag = 0;
+                    current_mag_declination = NaN;
+                    current_strength_bias = NaN;
+                end
+                current_jiao0_2 = 3;
+                current_jiao_mag_2 = 3;
+                current_bz2 = 3;
+                current_jiaom = 3;
+                current_jiaom_mag = 3;
+                current_bx_diff = 3;
+                current_by_diff = 3;
+                current_bz_diff = 3;
+                current_module_diff = 3;
+            end
+
+            % ========== 四元数平滑 ==========
+            float_temp = dot(self.quat_EKF, self.quat_Filter);
+            if float_temp < 0
+                self.quat_EKF = -self.quat_EKF;
+                float_temp = -float_temp;
+            end
+            float_temp = max(min(float_temp, 1), -1);
+            Angle = self.ACos(float_temp);
+            sinAngle = sin(Angle);
+            if sinAngle < 1e-5
+                self.quat_Filter = self.quat_EKF;
+            else
+                t = (1e-5 + (sinAngle - 1e-5)*0.01)/sinAngle;
+                InvSin = 1/sinAngle;
+                fCoeff0 = sin((1 - t)*Angle);
+                fCoeff1 = sin(t*Angle);
+                self.quat_Filter = (self.quat_Filter*fCoeff0 + self.quat_EKF*fCoeff1) * InvSin;
+                self.quat_Filter = self.Norm(self.quat_Filter);
+            end
+
+            % 更新上一状态
+            self.prev_state = self.current_state;
+
+
+            % 时间戳：累计时间
+            persistent total_time;
+            if isempty(total_time)
+                total_time = 0;
+            end
+            total_time = total_time + dtTime;
+            self.state_params_history.timestamp = [self.state_params_history.timestamp, total_time];
+
+            % ========== 四元数最终输出 ==========
+            q_out = self.quat_Filter;
+        end
+
+        %% 辅助函数
+        function out = Norm(self, vec)
+            out = vec / module(vec);
+        end
+
+        function out = ASin(self, value)
+            if value >= 1
+                out = pi/2;
+            elseif value <= -1
+                out = -pi/2;
+            else
+                out = asin(value);
+            end
+        end
+
+        function out = ACos(self, value)
+            if value >= 1
+                out = 0;
+            elseif value <= -1
+                out = pi;
+            else
+                out = acos(value);
+            end
+        end
+
+        function out = antisymmetry(self, vect)
+            out = [0, -vect(3), vect(2); ...
+                   vect(3), 0, -vect(1); ...
+                  -vect(2), vect(1), 0];
+        end
+
+        function q_out = ACCMAG2Quat(self, acc, mag)
+            PRY(1) = atan2(self.MeanACC(2), self.MeanACC(3));
+            PRY(2) = atan2(-self.MeanACC(1), sqrt(self.MeanACC(2)^2 + self.MeanACC(3)^2));
+            PRY(3) = atan2((self.MeanMAG(3)*sin(PRY(1)) - self.MeanMAG(2)*cos(PRY(1))), ...
+                           (self.MeanMAG(1)*cos(PRY(2)) + (self.MeanMAG(2)*sin(PRY(1)) + self.MeanMAG(3)*cos(PRY(1)))*sin(PRY(2))));
+            q_out = [cos(0.5*PRY(1))*cos(0.5*PRY(2))*cos(0.5*PRY(3)) + sin(0.5*PRY(1))*sin(0.5*PRY(2))*sin(0.5*PRY(3)), ...
+                     sin(0.5*PRY(1))*cos(0.5*PRY(2))*cos(0.5*PRY(3)) - cos(0.5*PRY(1))*sin(0.5*PRY(2))*sin(0.5*PRY(3)), ...
+                     cos(0.5*PRY(1))*sin(0.5*PRY(2))*cos(0.5*PRY(3)) + sin(0.5*PRY(1))*cos(0.5*PRY(2))*sin(0.5*PRY(3)), ...
+                     cos(0.5*PRY(1))*cos(0.5*PRY(2))*sin(0.5*PRY(3)) - sin(0.5*PRY(1))*sin(0.5*PRY(2))*cos(0.5*PRY(3))];
+        end
+
+        function q_out = ACC2Quat(self, acc)
+            PRY(:,1) = atan2(acc(:,2), acc(:,3));
+            PRY(:,2) = atan2(-acc(:,1), sqrt(acc(:,2).^2 + acc(:,3).^2));
+            q_out(:,1) = cos(0.5*PRY(:,1)).*cos(0.5*PRY(:,2)).*cos(0.5*PRY(:,3)) + sin(0.5*PRY(:,1)).*sin(0.5*PRY(:,2)).*sin(0.5*PRY(:,3));
+            q_out(:,2) = sin(0.5*PRY(:,1)).*cos(0.5*PRY(:,2)).*cos(0.5*PRY(:,3)) - cos(0.5*PRY(:,1)).*sin(0.5*PRY(:,2)).*sin(0.5*PRY(:,3));
+            q_out(:,3) = cos(0.5*PRY(:,1)).*sin(0.5*PRY(:,2)).*cos(0.5*PRY(:,3)) + sin(0.5*PRY(:,1)).*cos(0.5*PRY(:,2)).*sin(0.5*PRY(:,3));
+            q_out(:,4) = cos(0.5*PRY(:,1)).*cos(0.5*PRY(:,2)).*sin(0.5*PRY(:,3)) - sin(0.5*PRY(:,1)).*sin(0.5*PRY(:,2)).*cos(0.5*PRY(:,3));
+        end
+    end
+end
